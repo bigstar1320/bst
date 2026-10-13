@@ -1,0 +1,131 @@
+#include <Servo.h>
+#include <math.h>
+
+#define PIN_SERVO 10
+#define PIN_TRIG  12
+#define PIN_ECHO  13
+
+#define CLOSED_ANGLE 0
+#define OPEN_ANGLE 120
+#define DETECT_DISTANCE_CM 8.0f
+#define MOVING_TIME 3000UL
+#define CLEAR_DELAY 1000UL
+#define ECHO_TIMEOUT_US 30000UL
+
+Servo gateServo;
+
+int targetAngle = CLOSED_ANGLE;
+float currentAngle = CLOSED_ANGLE;
+float moveStartAngle = CLOSED_ANGLE;
+float moveTargetAngle = CLOSED_ANGLE;
+unsigned long moveStartTime = 0;
+unsigned long moveDuration = MOVING_TIME;
+bool moving = false;
+
+enum GateState { GATE_CLOSED, GATE_OPENING, GATE_OPEN, GATE_CLOSING };
+GateState gateState = GATE_CLOSED;
+unsigned long lastDetectedTime = 0;
+
+float readDistanceCm() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  unsigned long duration = pulseIn(PIN_ECHO, HIGH, ECHO_TIMEOUT_US);
+  if (duration == 0) return -1.0f;
+  return duration * 0.0343f / 2.0f;
+}
+
+void moveToAngle(int newTarget, unsigned long now) {
+  if (newTarget == targetAngle) return;
+
+  moveStartAngle = currentAngle;
+  moveTargetAngle = newTarget;
+  targetAngle = newTarget;
+  moveStartTime = now;
+
+  float angleRange = (float)(OPEN_ANGLE - CLOSED_ANGLE);
+  float travelRatio = fabsf(moveTargetAngle - moveStartAngle) / angleRange;
+  moveDuration = (unsigned long)(MOVING_TIME * travelRatio);
+  if (moveDuration == 0) moveDuration = 1;
+
+  moving = true;
+  gateState = (newTarget == OPEN_ANGLE) ? GATE_OPENING : GATE_CLOSING;
+}
+
+float easingFunction(float t) {
+    // Normalized sigmoid: easingFunction(0)=0 and easingFunction(1)=1.
+  const float k = 10.0f;
+  const float y0 = 1.0f / (1.0f + expf(k * 0.5f));
+  const float y1 = 1.0f / (1.0f + expf(-k * 0.5f));
+  const float y = 1.0f / (1.0f + expf(-k * (t - 0.5f)));
+  return (y - y0) / (y1 - y0);
+}
+
+// Returns true only on the loop in which a movement finishes.
+bool updateServo(unsigned long now) {
+  if (!moving) return false;
+
+  unsigned long elapsed = now - moveStartTime;
+  float t = (elapsed >= moveDuration) ? 1.0f :
+            (float)elapsed / (float)moveDuration;
+  float eased = easingFunction(t);
+
+  currentAngle = moveStartAngle + (moveTargetAngle - moveStartAngle) * eased;
+  gateServo.write((int)(currentAngle + 0.5f));
+
+  if (t >= 1.0f) {
+    currentAngle = moveTargetAngle;
+    gateServo.write((int)(currentAngle + 0.5f));
+    moving = false;
+    gateState = (targetAngle == OPEN_ANGLE) ? GATE_OPEN : GATE_CLOSED;
+    return true;
+  }
+  return false;
+}
+
+void setup() {
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  digitalWrite(PIN_TRIG, LOW);
+
+  gateServo.attach(PIN_SERVO);
+  gateServo.write(CLOSED_ANGLE);
+  currentAngle = CLOSED_ANGLE;
+  targetAngle = CLOSED_ANGLE;
+  gateState = GATE_CLOSED;
+}
+
+void loop() {
+  unsigned long now = millis();
+  float distanceCm = readDistanceCm();
+  bool vehicleDetected = (distanceCm > 0.0f &&
+                          distanceCm <= DETECT_DISTANCE_CM);
+
+  // A detected vehicle opens the barrier or reverses a closing movement.
+  if (vehicleDetected) {
+    lastDetectedTime = now;
+    if (targetAngle != OPEN_ANGLE) {
+      moveToAngle(OPEN_ANGLE, now);
+    }
+  }
+
+  bool movementJustFinished = updateServo(now);
+
+  // If the vehicle is already absent when opening finishes, start the
+  // clearance timer from full-open time, not from mid-opening detection.
+  if (movementJustFinished && gateState == GATE_OPEN && !vehicleDetected) {
+    lastDetectedTime = now;
+  }
+
+  // Close only after the barrier is fully open and detection has been absent
+  // for CLEAR_DELAY. Thus it cannot begin closing while still opening.
+  if (gateState == GATE_OPEN && !moving && !vehicleDetected &&
+      now - lastDetectedTime >= CLEAR_DELAY) {
+    moveToAngle(CLOSED_ANGLE, now);
+  }
+
+  delay(20);
+}
